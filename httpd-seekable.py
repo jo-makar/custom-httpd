@@ -69,7 +69,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('port', type=int, nargs='?', default=8000)
     parser.add_argument('--bind', '-b', default='0.0.0.0')
-    parser.add_argument('--directory', '-d', default='.')
     args = parser.parse_args()
 
     http.server.ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
