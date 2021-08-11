@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
 # Seekable http server (via minimally invasive changes to SimpleHTTPRequestHandler)
 # Intended to be a drop-in alternative to "python3 -m http.server" for streaming media
+#
+# Supports https with the -t flag:
+# Generate a self-signed certificate and private key:
+# Note that public (but not private) ips can and should be used for the cert common name
+# openssl req -x509 -nodes -newkey rsa:4096 -keyout server.key -out server.crt -subj '/CN=127.0.0.1'
 
-import argparse, http.server, os, re
+import argparse, base64, http.server, os, re, ssl
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     # Ref: https://github.com/python/cpython/blob/3.8/Lib/http/server.py
 
     def do_GET(self):
         try:
+            if hasattr(self.server, 'basicauth'):
+                if 'Authorization' not in self.headers or \
+                        self.headers['Authorization'] != self.server.basicauth:
+                    self.send_response(401)
+                    self.send_header('WWW-Authenticate', f'Basic realm={self.server.server_name}')
+                    self.end_headers()
+                    return
+
             if 'Range' not in self.headers:
                 super().do_GET()
 
@@ -38,7 +51,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     finally:
                         f.close()
 
-        # These are generally caused by the browser media player seeking to another point in the media file
+        # These are generally caused by the browser media player seeking to another point
         except BrokenPipeError:
             pass
         except ConnectionResetError:
@@ -49,8 +62,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             assert self._headers_buffer[0] == b'HTTP/1.0 200 OK\r\n'
             self._headers_buffer[0] = b'HTTP/1.0 206 OK\r\n'
 
-            self._headers_buffer = [h for h in self._headers_buffer if not h.startswith(b'Content-Length:')]
-            self.send_header('Content-Range', 'bytes {}-{}/{}'.format(self._range_start, self._range_stop, self._filesize))
+            self._headers_buffer = [h for h in self._headers_buffer
+                                        if not h.startswith(b'Content-Length:')]
+
+            self.send_header('Content-Range', 'bytes {}-{}/{}'.format(self._range_start,
+                                                                      self._range_stop,
+                                                                      self._filesize))
             self.send_header('Content-Length', 1 + self._range_stop - self._range_start)
 
         super().end_headers()
@@ -59,9 +76,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if code != 200 or os.path.isdir(self.translate_path(self.path)):
             super().log_request(code, size)
         elif hasattr(self, '_range_start') and hasattr(self, '_range_stop'):
+            size = 1 + self._range_stop - self._range_start
             super().log_request(code, '{} - {} / {}'.format(self._range_start,
                                                             self._range_stop,
-                                                            1 + self._range_stop - self._range_start))
+                                                            size))
         else:
             super().log_request(code, os.path.getsize(self.translate_path(self.path)))
 
@@ -69,6 +87,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('port', type=int, nargs='?', default=8000)
     parser.add_argument('--bind', '-b', default='0.0.0.0')
+    parser.add_argument('--tls', '-t', action='store_true')
+    parser.add_argument('--auth', '-a', type=str)
     args = parser.parse_args()
 
-    http.server.ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
+    httpd = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
+
+    if args.tls:
+        httpd.socket = ssl.wrap_socket(httpd.socket,
+                                       certfile='./server.crt', keyfile='./server.key',
+                                       server_side=True)
+
+    if args.auth:
+        assert len(args.auth.split(':', maxsplit=1)) == 2
+        httpd.basicauth = f'Basic {base64.b64encode(args.auth.encode("utf-8")).decode("utf-8")}'
+
+    httpd.serve_forever()
