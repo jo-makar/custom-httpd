@@ -8,12 +8,6 @@ Http server with (file) post support
 
 Intended client use: `curl -F 'file=@/path/to/file' ...`
 
-Supports https with the -t flag:
-- Generate a self-signed certificate and private key:
-  - Note that public (but not private) ips can and should be used for the certificate common name
-  - `openssl req -x509 -nodes -newkey rsa:4096 -keyout server.key -out server.crt -subj '/CN=127.0.0.1'`
-- Specify the certificate with --cacert to allow curl to verify the server
-
 ## httpd-redirect.go
 
 Http server that redirects to itself endlessly
@@ -27,3 +21,7 @@ Intended to be a drop-in alternative to "python3 -m http.server" for streaming m
 ## httpd-slow.go
 
 Http server that (maliciously) throttles download speeds
+
+## http-server.lisp
+
+Simple http server implemented in Common Lisp
