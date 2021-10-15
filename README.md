@@ -18,10 +18,12 @@ Seekable http server (via minimally invasive changes to SimpleHTTPRequestHandler
 
 Intended to be a drop-in alternative to "python3 -m http.server" for streaming media
 
+## httpd-seekable.lisp
+
+Another seekable http server
+
+Index view supports sorting by filename, size and date
+
 ## httpd-slow.go
 
 Http server that (maliciously) throttles download speeds
-
-## http-server.lisp
-
-Simple http server implemented in Common Lisp
