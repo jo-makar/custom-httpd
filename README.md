@@ -20,7 +20,7 @@ Intended to be a drop-in alternative to "python3 -m http.server" for streaming m
 
 ## httpd-seekable.lisp
 
-Another seekable http server
+Another seekable http server (developed against SBCL)
 
 Index view supports sorting by filename, size and date
 

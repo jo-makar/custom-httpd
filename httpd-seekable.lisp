@@ -1,5 +1,4 @@
-(require "asdf")
-(require "bordeaux-threads")
+(require 'sb-bsd-sockets)
 
 
 (define-condition http-server/invalid-request-line
@@ -10,34 +9,6 @@
              (format s "invalid request line: ~S" (line c)))))
 
 
-(defun http-server/parse-request-line (line)
-  (let* ((i (position #\space line))
-         (j (and i (position #\space line :start (1+ i)))))
-
-    (or (and i j (> i 0) (> j (1+ i)) (< j (1- (length line))))
-        (error (make-condition 'http-server/invalid-request-line :line line)))
-
-    (let ((verb  (subseq line 0 i))
-          (path  (subseq line (1+ i) j))
-          (proto (subseq line (1+ j))))
-
-      (or (every #'alpha-char-p verb)
-          (error (make-condition 'http-server/invalid-request-line :line line)))
-
-      (let ((p (string-upcase proto)))
-        (or (equal p "HTTP/1.1")
-            (equal p "HTTP/1.0")
-            (error (make-condition 'http-server/invalid-request-line :line line))))
-
-      (let ((q (position #\? path)))
-        (if q
-          (list verb (subseq path 0 q) (subseq path q) proto)
-          (let ((f (position #\# path)))
-            (if f
-              (list verb (subseq path 0 f) (subseq path f) proto)
-              (list verb path nil proto))))))))
-
-
 (define-condition http-server/invalid-header
                   (error)
                   ((line :initarg :line
@@ -46,63 +17,104 @@
              (format s "invalid header: ~S" (line c)))))
 
 
-(defun http-server/parse-headers (stream)
-  (let ((lines (labels ((eater (stream consumed)
-                          (let ((line (read-line stream)))
-                            (if (equal line "")
-                              (reverse consumed)
-                              (eater stream (cons line consumed))))))
-                 (eater stream '()))))
-
-    (labels ((parser (line)
-               (let ((i (position #\: line)))
-
-                 (or (and i (> i 0) (< i (1- (length line))))
-                     (error (make-condition 'http-server/invalid-header :line line)))
-
-                 (let ((key (subseq line 0 i))
-                       (val (string-trim '(#\space #\tab) (subseq line (1+ i)))))
-
-                   (or (> (length val) 0)
-                       (error (make-condition 'http-server/invalid-header :line line)))
-
-                   (cons key val)))))
-
-      (mapcar #'parser lines))))
-
-
 (defun http-server/serve (handler &optional port addr)
   (or port (setq port 8000))
-  (or addr (setq addr "0.0.0.0"))
+  (or addr (setq addr #(0 0 0 0)))
 
-  (let ((server-socket (socket:socket-server port :interface addr)))
-    (socket:socket-options server-socket :SO-REUSEADDR 1)
+  (labels ((header-read-line (stream)
+             (string-right-trim '(#\return) (read-line stream)))
 
-    (handler-case
-      (loop
-        (let ((client-socket (socket:socket-accept server-socket)))
-          (handler-case
-            (with-open-stream (client-stream client-socket)
-              (loop
-                (let ((request (http-server/parse-request-line (read-line client-stream)))
-                      (headers (http-server/parse-headers client-stream)))
 
-                  (funcall handler client-stream request headers)
+           (parse-request-line (line)
+             (let* ((i (position #\space line))
+                    (j (and i (position #\space line :start (1+ i)))))
 
-                  (or (open-stream-p client-stream) (return)))))
+               (or (and i j (> i 0) (> j (1+ i)) (< j (1- (length line))))
+                   (error (make-condition 'http-server/invalid-request-line :line line)))
 
-            (end-of-file (c)
-              (close client-socket))
-            (t (c)
-              (close client-socket)
-              (format t "~a" c)))))
+               (let ((verb  (subseq line 0 i))
+                     (path  (subseq line (1+ i) j))
+                     (proto (subseq line (1+ j))))
 
-        (t (c)
-          (socket:socket-server-close server-socket)
-          (format t "~a" c)))))
+                 (or (every #'alpha-char-p verb)
+                     (error (make-condition 'http-server/invalid-request-line :line line)))
+
+                 (let ((p (string-upcase proto)))
+                   (or (equal p "HTTP/1.1")
+                       (equal p "HTTP/1.0")
+                       (error (make-condition 'http-server/invalid-request-line :line line))))
+
+                 (let ((q (position #\? path)))
+                   (if q
+                     (list verb (subseq path 0 q) (subseq path q) proto)
+                     (let ((f (position #\# path)))
+                       (if f
+                         (list verb (subseq path 0 f) (subseq path f) proto)
+                         (list verb path nil proto))))))))
+
+              
+           (parse-headers (stream)
+             (let ((lines (labels ((eater (stream consumed)
+                                     (let ((line (header-read-line stream)))
+                                       (if (equal line "")
+                                         (reverse consumed)
+                                         (eater stream (cons line consumed))))))
+                            (eater stream '()))))
+
+               (labels ((parser (line)
+                          (let ((i (position #\: line)))
+
+                            (or (and i (> i 0) (< i (1- (length line))))
+                                (error (make-condition 'http-server/invalid-header :line line)))
+
+                            (let ((key (subseq line 0 i))
+                                  (val (string-trim '(#\space #\tab) (subseq line (1+ i)))))
+
+                              (or (> (length val) 0)
+                                  (error (make-condition 'http-server/invalid-header :line line)))
+
+                              (cons key val)))))
+
+                 (mapcar #'parser lines)))))
+
+
+    (let ((server-socket (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+      (setf (sb-bsd-sockets:sockopt-reuse-address server-socket) t)
+      (sb-bsd-sockets:socket-bind server-socket addr port)
+      (sb-bsd-sockets:socket-listen server-socket 1)
+
+      (handler-case
+        (loop
+          (let ((client-socket (sb-bsd-sockets:socket-accept server-socket)))
+            (handler-case
+
+              (sb-thread:make-thread
+                (lambda ()
+                  (with-open-stream (client-stream (sb-bsd-sockets:socket-make-stream
+                                                     client-socket :input t :output t))
+                    (loop
+                      (let ((request (parse-request-line (header-read-line client-stream)))
+                            (headers (parse-headers client-stream)))
+
+                        (funcall handler client-stream request headers)
+
+                        (or (open-stream-p client-stream) (return)))))))
+
+              (end-of-file (c)
+                (declare (ignore c))
+                (sb-bsd-sockets:socket-close client-socket))
+              (t (c)
+                (sb-bsd-sockets:socket-close client-socket)
+                (format t "~a" c)))))
+
+          (t (c)
+            (sb-bsd-sockets:socket-close server-socket)
+            (format t "~a" c))))))
 
 
 (defun http-server/hello-world-handler (client request headers)
+  (declare (ignore request headers))
+
   (let ((stream (make-string-output-stream)))
     (princ "<html><body>Hello world</body></html>" stream)
 
@@ -118,8 +130,9 @@
       (close client))))
 
 
-; FIXME STOPPED introduce use of threads for each client socket => (bt:make-thread (lambda () 'foo))
-; FIXME move all the functions under http-server/serv
+; FIXME
+(http-server/serve #'http-server/hello-world-handler)
+
 ; FIXME index pages should support sorting by filename, size and date
 ; FIXME the seekable handler should set Connection: keep-alive and not close the socket stream
 
