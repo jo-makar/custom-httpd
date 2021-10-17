@@ -61,19 +61,19 @@
                                          (eater stream (cons line consumed))))))
                             (eater stream '()))))
 
-               (labels ((parser (line)
-                          (let ((i (position #\: line)))
+               (flet ((parser (line)
+                        (let ((i (position #\: line)))
 
-                            (or (and i (> i 0) (< i (1- (length line))))
+                          (or (and i (> i 0) (< i (1- (length line))))
+                              (error (make-condition 'http-server/invalid-header :line line)))
+
+                          (let ((key (subseq line 0 i))
+                                (val (string-trim '(#\space #\tab) (subseq line (1+ i)))))
+
+                            (or (> (length val) 0)
                                 (error (make-condition 'http-server/invalid-header :line line)))
 
-                            (let ((key (subseq line 0 i))
-                                  (val (string-trim '(#\space #\tab) (subseq line (1+ i)))))
-
-                              (or (> (length val) 0)
-                                  (error (make-condition 'http-server/invalid-header :line line)))
-
-                              (cons key val)))))
+                            (cons key val)))))
 
                  (mapcar #'parser lines)))))
 
@@ -137,64 +137,88 @@
 (defun http-server/seekable-handler (client request headers)
   (declare (ignore headers)) ; FIXME
 
-  (let ((client-stream (car client))
-        (client-socket (cadr client))
-        (verb          (car request))
-        (path          (cadr request)))
+  (let* ((client-stream   (car client))
+         (client-socket   (cadr client))
+         (request-verb    (car request))
+         (request-path    (cadr request))
+        
+         (filesystem-path (merge-pathnames *default-pathname-defaults* (pathname request-path))))
 
-    (labels ((response (status &optional body content-type)
 
-               (let ((statuses '((200 . "OK")
-                                 (400 . "Bad Request")
-                                 (403 . "Forbidden"))))
+    (flet ((response (status &optional body content-type)
 
-                 (format client-stream "HTTP/1.1 ~d ~a~c~c"
-                   status (cdr (assoc status statuses)) #\return #\linefeed))
+             (let ((statuses '((200 . "OK")
+                               (400 . "Bad Request")
+                               (403 . "Forbidden")
+                               (404 . "Not Found"))))
 
-               (let ((days   '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
-                     (months '("x" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")))
+               (format client-stream "HTTP/1.1 ~d ~a~c~c"
+                 status (cdr (assoc status statuses)) #\return #\linefeed))
 
-                 (multiple-value-bind
-                   (sec min hour date month year day)
-                   (decode-universal-time (get-universal-time) 0)
+             (let ((days   '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
+                   (months '("x" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")))
 
-                   (format client-stream "Date: ~a, ~2,'0d ~a ~d ~2,'0d:~2,'0d:~2,'0d GMT~c~c"
-                     (nth day days) date (nth month months) year hour min sec #\return #\linefeed)))
+               (multiple-value-bind
+                 (sec min hour date month year day)
+                 (decode-universal-time (get-universal-time) 0)
 
-               (format client-stream "Content-Length: ~d~c~c" (length body) #\return #\linefeed)
+                 (format client-stream "Date: ~a, ~2,'0d ~a ~d ~2,'0d:~2,'0d:~2,'0d GMT~c~c"
+                   (nth day days) date (nth month months) year hour min sec #\return #\linefeed)))
+
+             (format client-stream "Content-Length: ~d~c~c" (length body) #\return #\linefeed)
+
+             (when body
+               (or content-type (setq content-type "text/html"))
+               (format client-stream "Content-Type: ~a~c~c" content-type #\return #\linefeed))
+
+             (let ((ok (and (< status 300) (>= status 200))))
+               (format client-stream "Connection: ~a~c~c"
+                 (if ok "keep-alive" "close") #\return #\linefeed)
+
+               (format client-stream "~c~c" #\return #\linefeed)
 
                (when body
-                 (or content-type (setq content-type "text/html"))
-                 (format client-stream "Content-Type: ~a~c~c" content-type #\return #\linefeed))
+                 (write-sequence body client-stream)
+                 (finish-output client-stream))
 
-               (let ((ok (and (< status 300) (>= status 200))))
-                 (format client-stream "Connection: ~a~c~c"
-                   (if ok "keep-alive" "close") #\return #\linefeed)
+               (unless ok
+                 (close client-stream))
 
-                 (format client-stream "~c~c" #\return #\linefeed)
+               (return-from http-server/seekable-handler))))
+                     
 
-                 (when body
-                   (write-sequence body client-stream)
-                   (finish-output client-stream))
-
-                 (unless ok (close client-stream))
-
-                 (return-from http-server/seekable-handler)))
-
-             (ip-to-string (ip)
+      (flet ((ip-to-string (ip)
                (reduce (lambda (a b)
                          (concatenate 'string a "." b))
                        (mapcar #'write-to-string (coerce ip 'list)))))
 
-      (multiple-value-bind (ip port) (sb-bsd-sockets:socket-peername client-socket)
-        (format t "~a:~d: ~a ~a~%" (ip-to-string ip) port verb path))
+        (multiple-value-bind (ip port) (sb-bsd-sockets:socket-peername client-socket)
+          (format t "~a:~d: ~a ~a~%" (ip-to-string ip) port request-verb request-path)))
 
-      (unless (equal (string-upcase verb) "GET") (response 400))
+      (unless (equal (string-upcase request-verb) "GET")
+        (response 400))
 
-      ; FIXME STOPPED determine if path valid and if for a file or dir and handle appropriately
-      ;               index pages should support sorting by filename, size and date (via javascript)
-      (response 200 (format nil "<html><body>~a</body></html>" path))
-      )))
+      (unless (probe-file filesystem-path)
+        (response 404))
+
+      (flet ((path-under-basepath-p (path basepath)
+               (equal (search (directory-namestring basepath) (namestring path)) 0)))
+
+        (unless (path-under-basepath-p filesystem-path *default-pathname-defaults*)
+          (response 403)))
+
+      (if (not (pathname-name filesystem-path))
+
+        (progn
+          ; FIXME handle directory requests
+          ;       view to support sorting by filename, size and date (via javascript)
+          (response 200 (format nil "<html><body>directory ~a</body></html>" (namestring filesystem-path)))
+          )
+
+        (progn
+          ; FIXME handle file requests
+          (response 200 (format nil "<html><body>file ~a</body></html>" (namestring filesystem-path)))
+          )))))
 
 
 (http-server/serve #'http-server/seekable-handler)
