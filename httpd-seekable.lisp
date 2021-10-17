@@ -86,70 +86,116 @@
       (handler-case
         (loop
           (let ((client-socket (sb-bsd-sockets:socket-accept server-socket)))
-            (handler-case
 
-              (sb-thread:make-thread
-                (lambda ()
+            (sb-thread:make-thread
+              (lambda ()
+                (handler-case
+
                   (with-open-stream (client-stream (sb-bsd-sockets:socket-make-stream
                                                      client-socket :input t :output t))
+
                     (loop
                       (let ((request (parse-request-line (header-read-line client-stream)))
                             (headers (parse-headers client-stream)))
 
-                        (funcall handler client-stream request headers)
+                        (funcall handler (list client-stream client-socket) request headers)
 
-                        (or (open-stream-p client-stream) (return)))))))
+                        (or (open-stream-p client-stream) (return)))))
+                    
+                  (end-of-file (c)
+                    (declare (ignore c))
+                    (sb-bsd-sockets:socket-close client-socket))
 
-              (end-of-file (c)
-                (declare (ignore c))
-                (sb-bsd-sockets:socket-close client-socket))
-              (t (c)
-                (sb-bsd-sockets:socket-close client-socket)
-                (format t "~a" c)))))
+                  (t (c)
+                    (sb-bsd-sockets:socket-close client-socket)
+                    (format t "~a" c)))))))
 
-          (t (c)
-            (sb-bsd-sockets:socket-close server-socket)
-            (format t "~a" c))))))
+        (t (c)
+          (sb-bsd-sockets:socket-close server-socket)
+          (format t "~a" c))))))
 
 
 (defun http-server/hello-world-handler (client request headers)
   (declare (ignore request headers))
 
-  (let ((stream (make-string-output-stream)))
-    (princ "<html><body>Hello world</body></html>" stream)
+  (let ((client-stream (car client))
+        (body-stream (make-string-output-stream)))
+    (princ "<html><body>Hello world</body></html>" body-stream)
 
-    (let ((body (get-output-stream-string stream)))
-      (format client "HTTP/1.1 200 OK~c~c" #\return #\linefeed)
-      (format client "Content-Type: text/html~c~c" #\return #\linefeed)
-      (format client "Content-Length: ~d~c~c" (length body) #\return #\linefeed)
-      (format client "Connection: close~c~c" #\return #\linefeed)
-      (format client "~c~c" #\return #\linefeed)
+    (let ((body (get-output-stream-string body-stream)))
+      (format client-stream "HTTP/1.1 200 OK~c~c" #\return #\linefeed)
+      (format client-stream "Content-Type: text/html~c~c" #\return #\linefeed)
+      (format client-stream "Content-Length: ~d~c~c" (length body) #\return #\linefeed)
+      (format client-stream "Connection: close~c~c" #\return #\linefeed)
+      (format client-stream "~c~c" #\return #\linefeed)
 
-      (princ body client)
+      (princ body client-stream)
 
-      (close client))))
+      (close client-stream))))
 
 
-; FIXME
-(http-server/serve #'http-server/hello-world-handler)
+(defun http-server/seekable-handler (client request headers)
+  (declare (ignore headers)) ; FIXME
 
-; FIXME index pages should support sorting by filename, size and date
-; FIXME the seekable handler should set Connection: keep-alive and not close the socket stream
+  (let ((client-stream (car client))
+        (client-socket (cadr client))
+        (verb          (car request))
+        (path          (cadr request)))
 
-;(defun http-server/date-header ()
-;  (let ((days   '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
-;        (months '("x" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")))
-;    (multiple-value-bind
-;      (sec min hour date month year day-of-week)
-;      (decode-universal-time (get-universal-time) 0)
-;
-;      (format nil "Date: ~a, ~2,'0d ~a ~d ~2,'0d:~2,'0d:~2,'0d GMT~c~c"
-;        (nth day-of-week days)
-;        date
-;        (nth month months)
-;        year
-;        hour
-;        min
-;        sec
-;        #\return
-;        #\linefeed))))
+    (labels ((response (status &optional body content-type)
+
+               (let ((statuses '((200 . "OK")
+                                 (400 . "Bad Request")
+                                 (403 . "Forbidden"))))
+
+                 (format client-stream "HTTP/1.1 ~d ~a~c~c"
+                   status (cdr (assoc status statuses)) #\return #\linefeed))
+
+               (let ((days   '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
+                     (months '("x" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")))
+
+                 (multiple-value-bind
+                   (sec min hour date month year day)
+                   (decode-universal-time (get-universal-time) 0)
+
+                   (format client-stream "Date: ~a, ~2,'0d ~a ~d ~2,'0d:~2,'0d:~2,'0d GMT~c~c"
+                     (nth day days) date (nth month months) year hour min sec #\return #\linefeed)))
+
+               (format client-stream "Content-Length: ~d~c~c" (length body) #\return #\linefeed)
+
+               (when body
+                 (or content-type (setq content-type "text/html"))
+                 (format client-stream "Content-Type: ~a~c~c" content-type #\return #\linefeed))
+
+               (let ((ok (and (< status 300) (>= status 200))))
+                 (format client-stream "Connection: ~a~c~c"
+                   (if ok "keep-alive" "close") #\return #\linefeed)
+
+                 (format client-stream "~c~c" #\return #\linefeed)
+
+                 (when body
+                   (write-sequence body client-stream)
+                   (finish-output client-stream))
+
+                 (unless ok (close client-stream))
+
+                 (return-from http-server/seekable-handler)))
+
+             (ip-to-string (ip)
+               (reduce (lambda (a b)
+                         (concatenate 'string a "." b))
+                       (mapcar #'write-to-string (coerce ip 'list)))))
+
+      (multiple-value-bind (ip port) (sb-bsd-sockets:socket-peername client-socket)
+        (format t "~a:~d: ~a ~a~%" (ip-to-string ip) port verb path))
+
+      (unless (equal (string-upcase verb) "GET") (response 400))
+
+      ; FIXME STOPPED determine if path valid and if for a file or dir and handle appropriately
+      ;               index pages should support sorting by filename, size and date (via javascript)
+      (response 200 (format nil "<html><body>~a</body></html>" path))
+      )))
+
+
+(http-server/serve #'http-server/seekable-handler)
+
