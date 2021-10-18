@@ -1,4 +1,5 @@
 (require 'sb-bsd-sockets)
+(require 'sb-posix)
 
 
 (define-condition http-server/invalid-request-line
@@ -44,13 +45,21 @@
                        (equal p "HTTP/1.0")
                        (error (make-condition 'http-server/invalid-request-line :line line))))
 
-                 (let ((q (position #\? path)))
-                   (if q
-                     (list verb (subseq path 0 q) (subseq path q) proto)
-                     (let ((f (position #\# path)))
-                       (if f
-                         (list verb (subseq path 0 f) (subseq path f) proto)
-                         (list verb path nil proto))))))))
+                 (let ((q (position #\? path))
+                       (f (position #\# path)))
+                   
+                   (cond
+                     ((and (null q) (null f))
+                       (list verb path nil nil proto))
+                     
+                     ((and (null q) f)
+                       (list verb (subseq path 0 f) nil (subseq path f) proto))
+                     
+                     ((or (and q (null f)) (and q f (< f q)))
+                       (list verb (subseq path 0 q) (subseq path q) nil proto))
+                     
+                     (t ; (and q f (< q f))
+                       (list verb (subseq path 0 q) (subseq path q f) (subseq path f) proto)))))))
 
               
            (parse-headers (stream)
@@ -141,8 +150,11 @@
          (client-socket   (cadr client))
          (request-verb    (car request))
          (request-path    (cadr request))
+         (request-query   (caddr request))
         
-         (filesystem-path (merge-pathnames *default-pathname-defaults* (pathname request-path))))
+         (filesystem-path (let ((p (pathname request-path)))
+                            (setf (car (pathname-directory p)) :relative)
+                            (merge-pathnames p *default-pathname-defaults*))))
 
 
     (flet ((response (status &optional body content-type)
@@ -193,7 +205,8 @@
                        (mapcar #'write-to-string (coerce ip 'list)))))
 
         (multiple-value-bind (ip port) (sb-bsd-sockets:socket-peername client-socket)
-          (format t "~a:~d: ~a ~a~%" (ip-to-string ip) port request-verb request-path)))
+          (format t "~a:~d: ~a ~a ~a~%"
+            (ip-to-string ip) port request-verb request-path request-query)))
 
       (unless (equal (string-upcase request-verb) "GET")
         (response 400))
@@ -202,21 +215,168 @@
         (response 404))
 
       (flet ((path-under-basepath-p (path basepath)
-               (equal (search (directory-namestring basepath) (namestring path)) 0)))
+               (= (search (directory-namestring basepath) (namestring path)) 0)))
 
         (unless (path-under-basepath-p filesystem-path *default-pathname-defaults*)
           (response 403)))
 
       (if (not (pathname-name filesystem-path))
 
-        (progn
-          ; FIXME handle directory requests
-          ;       view to support sorting by filename, size and date (via javascript)
-          (response 200 (format nil "<html><body>directory ~a</body></html>" (namestring filesystem-path)))
-          )
+        (let ((body-stream (make-string-output-stream))
+
+              (sort-pred   #'string-lessp)
+              (sort-key    #'cadr))
+
+          (flet ((parse-query (query)
+                   (labels ((decode-param (s)
+                              (labels ((eater (l m)
+                                (if (null l)
+                                  m
+                                  (case (car l)
+
+                                    (#\%       (if (and (>= (length l) 3)
+                                                        (digit-char-p (cadr l) 16)
+                                                        (digit-char-p (caddr l) 16))
+
+                                                 (eater (cdddr l) 
+                                                        (cons
+                                                          (code-char
+                                                            (parse-integer
+                                                              (coerce (list (cadr l) (caddr l))
+                                                                      'string)
+                                                              :radix 16))
+                                                          m))
+                                                  
+                                                 (eater (cdr l) (cons (car l) m))))
+
+                                    (#\+       (eater (cdr l) (cons #\space m)))
+                                    (otherwise (eater (cdr l) (cons (car l) m)))))))
+
+                                (coerce (reverse (eater (coerce s 'list) nil)) 'string)))
+                   
+                            (tokenizer (s l)
+                              (if (= (length s) 0)
+                                l
+                                (let ((i (position #\& s)))
+                                  (cond
+                                    ((null i) (cons s l))
+                                    ((= i 0)  (tokenizer (subseq s 1) l))
+                                    (t        (tokenizer (subseq s (1+ i))
+                                                         (cons (subseq s 0 i) l)))))))
+
+                            (splitter (s)
+                              (let ((i (position #\= s)))
+                                (if i
+                                  (cons (decode-param (subseq s 0 i))
+                                        (decode-param (subseq s (1+ i))))
+                                  (cons (decode-param s) nil)))))
+
+                     (when query
+                       (mapcar #'splitter (tokenizer (subseq query 1) nil)))))
+          
+                 (path-to-href (path)
+                   (concatenate 'string "/"
+                     (enough-namestring (namestring path)
+                                        (namestring *default-pathname-defaults*))))
+
+                 (path-basename (path)
+                   (if (pathname-name path)
+                     (concatenate 'string (pathname-name path) "." (pathname-type path))
+                     (concatenate 'string (car (reverse (pathname-directory path))) "/")))
+
+                 (write-entry (href name last-mod size)
+                   (format body-stream "<tr><td><a href=\"~a\">~a</a></td>" href name)
+
+                   (if last-mod
+                     (format body-stream "<td>~a</td>" last-mod)
+                     (format body-stream "<td></td>"))
+
+                   (if size
+                     (format body-stream "<td class=\"right\">~a</td>" size)
+                     (format body-stream "<td></td>"))
+
+                   (format body-stream "</tr>~%")))
+
+            (format body-stream "<html>~%")
+
+            (format body-stream "<head><style>~%")
+            (format body-stream ".right { text-align: right; }~%")
+            (format body-stream "</style></head>~%")
+
+            (format body-stream "<body>~%")
+            (format body-stream "<h1>Index of ~a</h1>~%" (namestring filesystem-path))
+
+            (format body-stream "<table><tr>~%")
+
+            (let* ((query     (parse-query request-query))
+                   (sort-col  (cdr (assoc "c" query :test #'equal)))
+                   (sort-dir  (cdr (assoc "s" query :test #'equal))))
+
+              (or (equal sort-col "n") (equal sort-col "l") (equal sort-col "s") (setq sort-col "n"))
+              (or (equal sort-dir "a") (equal sort-dir "d") (setq sort-dir "a"))
+
+              (setq sort-pred (if (or (equal sort-col "n") (equal sort-col "l"))
+
+                                (lambda (a b)
+                                  (let ((p (if (equal sort-dir "a") #'string< #'string>)))
+                                    (funcall p (string-downcase a) (string-downcase b))))
+
+                                (lambda (a b)
+                                  (let ((p (if (equal sort-dir "a") #'< #'>)))
+                                    (funcall p (parse-integer a) (parse-integer b))))))
+
+              (setq sort-key (cond ((equal sort-col "n") #'cadr)
+                                   ((equal sort-col "l") #'caddr)
+                                   ((equal sort-col "s") #'cadddr)))
+
+              (format body-stream "<th><a href=\"~a?c=n&s=~a\">Name</a></th>~%"
+                (path-to-href filesystem-path)
+                (if (and (equal sort-col "n") (equal sort-dir "a")) "d" "a"))
+
+              (format body-stream "<th><a href=\"~a?c=l&s=~a\">Last modified</th>~%"
+                (path-to-href filesystem-path)
+                (if (and (equal sort-col "l") (equal sort-dir "a")) "d" "a"))
+
+              (format body-stream "<th><a href=\"~a?c=s&s=~a\">Size</th></tr>~%"
+                (path-to-href filesystem-path)
+                (if (and (equal sort-col "s") (equal sort-dir "a")) "d" "a")))
+
+            (unless (equal filesystem-path *default-pathname-defaults*)
+              (write-entry (path-to-href (truename (merge-pathnames filesystem-path "..")))
+                           "Parent directory"
+                           nil
+                           nil))
+
+            (mapc
+              (lambda (entry) (apply #'write-entry entry))
+
+              (sort
+                (mapcar (lambda (path)
+                          (let ((stat (sb-posix:stat (namestring path))))
+                            (multiple-value-bind
+                              (sec min hour date month year)
+                              (decode-universal-time (sb-posix:stat-mtime stat))
+
+                              (setq year (+ year 70))
+
+                              (list
+                                (path-to-href path)
+                                (path-basename path)
+                                (format nil "~d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d"
+                                  year month date hour min sec)
+                                (write-to-string (sb-posix:stat-size stat))))))
+
+                        (directory (merge-pathnames filesystem-path (pathname "*.*"))))
+                sort-pred
+                :key sort-key))
+
+            (format body-stream "</table></body></html>~%")
+
+            (let ((body (get-output-stream-string body-stream)))
+              (response 200 body))))
 
         (progn
-          ; FIXME handle file requests
+          ; FIXME handle file requests including range/etc headers, ref python code
           (response 200 (format nil "<html><body>file ~a</body></html>" (namestring filesystem-path)))
           )))))
 
