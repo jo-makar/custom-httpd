@@ -117,7 +117,7 @@
 
                   (t (c)
                     (sb-bsd-sockets:socket-close client-socket)
-                    (format t "~a" c)))))))
+                    (format t "~a~%" c)))))))
 
         (t (c)
           (sb-bsd-sockets:socket-close server-socket)
@@ -144,8 +144,6 @@
 
 
 (defun http-server/seekable-handler (client request headers)
-  (declare (ignore headers)) ; FIXME
-
   (let* ((client-stream   (car client))
          (client-socket   (cadr client))
          (request-verb    (car request))
@@ -154,50 +152,128 @@
         
          (filesystem-path (let ((p (pathname request-path)))
                             (setf (car (pathname-directory p)) :relative)
-                            (merge-pathnames p *default-pathname-defaults*))))
+                            (merge-pathnames p *default-pathname-defaults*)))
+         
+         (range-start     nil)
+         (range-end       nil))
 
 
-    (flet ((response (status &optional body content-type)
+    (labels ((date-header ()
+               (let ((days   '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
+                     (months '("x" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")))
 
-             (let ((statuses '((200 . "OK")
-                               (400 . "Bad Request")
-                               (403 . "Forbidden")
-                               (404 . "Not Found"))))
+                 (multiple-value-bind
+                   (sec min hour date month year day)
+                   (decode-universal-time (get-universal-time) 0)
 
-               (format client-stream "HTTP/1.1 ~d ~a~c~c"
-                 status (cdr (assoc status statuses)) #\return #\linefeed))
+                   (format nil "Date: ~a, ~2,'0d ~a ~d ~2,'0d:~2,'0d:~2,'0d GMT~c~c"
+                     (nth day days) date (nth month months) year hour min sec #\return #\linefeed))))
 
-             (let ((days   '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
-                   (months '("x" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")))
 
-               (multiple-value-bind
-                 (sec min hour date month year day)
-                 (decode-universal-time (get-universal-time) 0)
+             (response (status &optional body binary content-type content-range)
 
-                 (format client-stream "Date: ~a, ~2,'0d ~a ~d ~2,'0d:~2,'0d:~2,'0d GMT~c~c"
-                   (nth day days) date (nth month months) year hour min sec #\return #\linefeed)))
+               (let ((statuses '((200 . "OK")
+                                 (206 . "Partial Content")
+                                 (400 . "Bad Request")
+                                 (403 . "Forbidden")
+                                 (404 . "Not Found"))))
 
-             (format client-stream "Content-Length: ~d~c~c" (length body) #\return #\linefeed)
+                 (format client-stream "HTTP/1.1 ~d ~a~c~c"
+                   status (cdr (assoc status statuses)) #\return #\linefeed))
 
-             (when body
-               (or content-type (setq content-type "text/html"))
-               (format client-stream "Content-Type: ~a~c~c" content-type #\return #\linefeed))
+               (format client-stream (date-header))
+               (format client-stream "Content-Length: ~d~c~c" (length body) #\return #\linefeed)
 
-             (let ((ok (and (< status 300) (>= status 200))))
-               (format client-stream "Connection: ~a~c~c"
-                 (if ok "keep-alive" "close") #\return #\linefeed)
+               (when content-type
+                 (format client-stream "Content-Type: ~a~c~c" content-type #\return #\linefeed))
 
+               (when content-range
+                 (format client-stream "Content-Range: ~a~c~c" content-range #\return #\linefeed))
+
+               (let ((ok (and (< status 300) (>= status 200))))
+                 (format client-stream "Connection: ~a~c~c"
+                   (if ok "keep-alive" "close") #\return #\linefeed)
+
+                 (format client-stream "~c~c" #\return #\linefeed)
+                 (finish-output client-stream)
+
+                 (when body
+                   (if binary
+                     (sb-bsd-sockets:socket-send client-socket body (length body))
+                     (progn
+                       (write-sequence body client-stream)
+                       (finish-output client-stream))))
+
+                 (unless ok
+                   (close client-stream))
+
+                 (return-from http-server/seekable-handler)))
+                 
+
+             (response-lazy (status content-length body-stream binary
+                             &optional content-type content-range)
+               
+               (let ((statuses '((200 . "OK") (206 . "Partial Content"))))
+                 (format client-stream "HTTP/1.1 ~d ~a~c~c"
+                   status (cdr (assoc status statuses)) #\return #\linefeed))
+
+               (format client-stream (date-header))
+               (format client-stream "Content-Length: ~d~c~c" content-length #\return #\linefeed)
+
+               (when content-type
+                 (format client-stream "Content-Type: ~a~c~c" content-type #\return #\linefeed))
+
+               (when content-range
+                 (format client-stream "Content-Range: ~a~c~c" content-range #\return #\linefeed))
+
+               (format client-stream "Connection: keep-alive~c~c" #\return #\linefeed)
                (format client-stream "~c~c" #\return #\linefeed)
+               (finish-output client-stream)
 
-               (when body
-                 (write-sequence body client-stream)
-                 (finish-output client-stream))
+               (if binary
 
-               (unless ok
-                 (close client-stream))
+                 (let ((buf (make-array (* 1024 256) :element-type '(unsigned-byte 8))))
+                   (loop for n = (read-sequence buf body-stream)
+                     do (sb-bsd-sockets:socket-send client-socket buf n)
+                        (when (< n (length buf))
+                          (return))))
 
-               (return-from http-server/seekable-handler))))
+                 (let ((buf (make-array (* 1024 256))))
+                   (loop for n = (read-sequence buf body-stream)
+                     do (write-sequence buf client-stream :end n)
+                        (when (< n (length buf))
+                          (progn
+                            (finish-output client-stream)
+                            (return))))))
+                      
+               (return-from http-server/seekable-handler)))
                      
+
+      (let ((header (cdr (assoc "Range" headers :test #'equal))))
+
+        (block header-parsing
+          (unless (equal (search "bytes=" header) 0)
+            (return-from header-parsing))
+
+          (let ((i (position #\= header))
+                (j (position #\- header)))
+            (unless (and i j (< i j))
+              (return-from header-parsing))
+
+            (let ((s (subseq header (1+ i) j))
+                  (e (subseq header (1+ j))))
+
+              (handler-case
+                (setq range-start (parse-integer s))
+                (parse-error (c)
+                  (declare (ignore c))
+                  (return-from header-parsing)))
+
+              (handler-case
+                (setq range-end (parse-integer e))
+                (parse-error (c)
+                  (declare (ignore c))
+                  (return-from header-parsing)))))))
 
       (flet ((ip-to-string (ip)
                (reduce (lambda (a b)
@@ -205,8 +281,8 @@
                        (mapcar #'write-to-string (coerce ip 'list)))))
 
         (multiple-value-bind (ip port) (sb-bsd-sockets:socket-peername client-socket)
-          (format t "~a:~d: ~a ~a ~a~%"
-            (ip-to-string ip) port request-verb request-path request-query)))
+          (format t "~a:~d: ~a ~a ~a ~a ~a~%"
+            (ip-to-string ip) port request-verb request-path request-query range-start range-end)))
 
       (unless (equal (string-upcase request-verb) "GET")
         (response 400))
@@ -281,7 +357,11 @@
 
                  (path-basename (path)
                    (if (pathname-name path)
-                     (concatenate 'string (pathname-name path) "." (pathname-type path))
+
+                     (if (pathname-type path)
+                       (concatenate 'string (pathname-name path) "." (pathname-type path))
+                       (pathname-name path))
+
                      (concatenate 'string (car (reverse (pathname-directory path))) "/")))
 
                  (write-entry (href name last-mod size)
@@ -373,12 +453,39 @@
             (format body-stream "</table></body></html>~%")
 
             (let ((body (get-output-stream-string body-stream)))
-              (response 200 body))))
+              (response 200 body nil "text/html"))))
 
-        (progn
-          ; FIXME handle file requests including range/etc headers, ref python code
-          (response 200 (format nil "<html><body>file ~a</body></html>" (namestring filesystem-path)))
-          )))))
+        (let ((filesize     (sb-posix:stat-size (sb-posix:stat (namestring filesystem-path))))
+              (content-type (let ((type (pathname-type filesystem-path)))
+                              (if (equal type "mp4")
+                                "video/mp4"
+                                nil))))
+
+          (with-open-file (file-stream filesystem-path :direction :input
+                                                       :element-type '(unsigned-byte 8))
+            (if range-start
+
+              (let ((buf  (make-array (* 1024 256) :element-type '(unsigned-byte 8)))
+                    (body (make-array 0 :element-type '(unsigned-byte 8) :fill-pointer 0)))
+
+                (file-position file-stream range-start)
+
+                (unless range-end
+                  (setq range-end (min (+ range-start (* 1024 1024 5)) (1- filesize))))
+
+                (let ((left (1+ (- range-end range-start))))
+                  (loop for n = (read-sequence buf file-stream)
+                    do (let ((o (min n left)))
+                         (loop for i from 0 to (1- o)
+                           do (vector-push-extend (aref buf i) body))
+                       (setq left (- left o))
+                       (when (= left 0)
+                         (return)))))
+
+                (let ((range (format nil "bytes ~d-~d/~d" range-start range-end filesize)))
+                  (response 206 body t content-type range)))
+
+              (response-lazy 200 filesize file-stream t content-type))))))))
 
 
 (http-server/serve #'http-server/seekable-handler)
