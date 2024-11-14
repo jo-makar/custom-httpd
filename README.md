@@ -2,6 +2,10 @@
 
 Custom http servers
 
+## httpd-log.py
+
+Http server that logs requests
+
 ## httpd-post.py
 
 Http server with (file) post support
