@@ -94,9 +94,9 @@ if __name__ == '__main__':
     httpd = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
 
     if args.tls:
-        httpd.socket = ssl.wrap_socket(httpd.socket,
-                                       certfile='./server.crt', keyfile='./server.key',
-                                       server_side=True)
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(certfile='./server.crt', keyfile='./server.key')
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
     if args.auth:
         assert len(args.auth.split(':', maxsplit=1)) == 2
